@@ -1,6 +1,0 @@
-../Core/Src/foc_core.c:40:6:FOC_Core_Init	1
-../Core/Src/foc_core.c:50:6:FOC_Update_Total_Angle	3
-../Core/Src/foc_core.c:59:6:FOC_Calc_SVPWM	11
-../Core/Src/foc_core.c:95:6:FOC_Cascade_Control_Loop	10
-../Core/Src/foc_core.c:138:6:FOC_Current_Control_Loop	1
-../Core/Src/foc_core.c:175:6:FOC_Change_Mode	4
