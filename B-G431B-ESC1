@@ -1,1 +1,1716 @@
-This source code implenents FOC (Field Oriented Control) algorithm using B-G431B-ESC1 development board with A2212 13T(1000KV) BLDC motor and AS5047 magnetic encoder.
+//This source code implenents FOC (Field Oriented Control) algorithm using B-G431B-ESC1 development board with A2212 13T(1000KV) BLDC motor and AS5047 magnetic encoder.
+
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2025 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "stdio.h"
+#include "math.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+typedef enum {
+	MODE_CURRENT = 0,
+	MODE_VELOCITY,
+	MODE_POSITION
+} ControlMode_t;
+
+typedef struct {
+	int pole_pairs;
+	float L_motor;
+	float R_motor;
+	float max_voltage;
+	float max_current;
+	float max_velocity;
+	float align_voltage;
+} MotorParams_t;
+
+typedef struct {
+	float current_val; //MODE_POSITION -> POS, MODE_VELOCITY -> VEL
+	float current_vel; //MODE_POSITION -> VEL, MODE_VELOCITY -> ACCEL.
+	float current_accel; ////MODE_POSITION -> ACCEL, MODE_VELOCITY -> JERK
+	uint32_t last_time_us;
+} ProfileState_t;
+
+
+typedef struct {
+	ControlMode_t control_mode;
+
+	float target_angle;
+	float target_velocity;
+	float target_Iq;
+	float target_Id;
+
+	float total_angle;
+	float prev_mech_angle;
+	int32_t rotation_count;
+
+	float prev_total_angle_vel;
+	float velocity_filtered;
+
+	float i_a, i_b, i_c;
+	float i_alpha, i_beta;
+	float i_d, i_q;
+
+	float theta_mech;
+	float theta_elec;
+	float theta_offset;
+	float velocity;
+
+	float v_d, v_q;
+	float v_alpha, v_beta;
+	float v_a, v_b, v_c;
+	float duty_a, duty_b, duty_c;
+} FOCState_t;
+
+typedef struct {
+    float v_alpha, v_beta;
+    float i_alpha, i_beta;
+
+    float A;        // 1 - R*Ts/L
+    float b;        // Ts/L
+    float b_inv;    // L/Ts
+    float k_gain;   // Sliding Gain (K_slide)
+    float g;        // BEMF Observer Gain
+    float Ts;       // Sampling Time
+    float min_operating_emf;
+
+    // --- State Variables ---
+    float i_alpha_est;
+    float i_beta_est;
+
+    float e_alpha_est; // Back-EMF (Estimated)
+    float e_beta_est;
+
+    float last_i_alpha_error;
+    float last_i_beta_error;
+
+    float emf_magnitude;
+    float e_theta;      // BEMF Angle (Electrical)
+    float theta_est;    // Estimated Rotor Angle
+    float last_e_theta;
+
+    float omega_est;    // Speed estimated from SMO
+    float velocity_est; // mechanical anglular velocity (rad/s)
+    float omega_alpha_filter; // Speed LPF Gain
+
+    float phase_advance_gain;
+} SMO_Handle_t;
+
+typedef struct {
+	float Kp;
+	float Ki;
+	float Kd;
+	float integral_err;
+	float prev_err;
+	float limit;
+} PID_t;
+
+typedef struct {
+	float ia_offset;
+	float ib_offset;
+} CurrentOffset_t;
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define _PI_3 1.04719755f
+#define _SQRT3 1.73205081f
+#define _2PI 6.283185307f
+#define _PI 3.141592653f
+
+#define CURRENT_SENSE_GAIN -0.01678f
+#define CURRENT_TO_TORQUE 0.009549f
+
+#define MOTOR_R_OHM 0.072479795f
+#define MOTOR_L_HENRY 0.0000217f
+#define BANDWIDTH 100 //[Hz]
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+#define CONSTRAIN(x, min, max) ((x) < (min) ? (min) : ((x) > (max) ? (max) : (x)))
+#define SIGN(x) ((x > 0) ? 1.0f : -1.0f)
+
+//===SPI Setup================================//
+// 1. CS -> PB8
+#define CS_HIGH()   (GPIOB->BSRR = (1 << 8))
+#define CS_LOW()    (GPIOB->BSRR = (1 << 24))
+// 2. CLK (Clock) -> PB6
+#define CLK_HIGH()  (GPIOB->BSRR = (1 << 6))
+#define CLK_LOW()   (GPIOB->BSRR = (1 << 22))
+// 3. MOSI (Master Out) -> PB7 (CONST HIGH -> not used)
+// 4. MISO (Master In) -> PA15
+#define MISO_READ() ((GPIOA->IDR & (1 << 15)) ? 1 : 0)
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+ADC_HandleTypeDef hadc2;
+DMA_HandleTypeDef hdma_adc1;
+DMA_HandleTypeDef hdma_adc2;
+
+CORDIC_HandleTypeDef hcordic;
+
+FDCAN_HandleTypeDef hfdcan1;
+
+OPAMP_HandleTypeDef hopamp1;
+OPAMP_HandleTypeDef hopamp2;
+OPAMP_HandleTypeDef hopamp3;
+
+TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim6;
+TIM_HandleTypeDef htim16;
+
+UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart2_rx;
+DMA_HandleTypeDef hdma_usart2_tx;
+
+/* USER CODE BEGIN PV */
+uint16_t velocity_loop_cnt = 0;
+uint16_t position_loop_cnt = 0;
+
+float angle_diff;
+uint16_t dt_us;
+volatile uint8_t is_foc_enabled = 0;
+CurrentOffset_t offset = {2048.0f, 2048.0f};
+
+MotorParams_t motor_params = {
+	.pole_pairs = 7,
+	.max_voltage = 10.0f, //[V]
+	.max_current = 10.0f, //[A]
+	.align_voltage = 2.0f, //[V]
+	.max_velocity = 800.0f, //[rad/s], 80% of Kv value
+	.R_motor = MOTOR_R_OHM,
+	.L_motor = MOTOR_L_HENRY
+};
+
+//Current Loop Gain (Calculated by L&H)
+PID_t pid_iq = {.Kp = MOTOR_L_HENRY * BANDWIDTH * 2 * _PI, .Ki = MOTOR_R_OHM * BANDWIDTH * 2 * _PI, .limit = 10.0f};
+PID_t pid_id = {.Kp = MOTOR_L_HENRY * BANDWIDTH * 2 * _PI, .Ki = MOTOR_R_OHM * BANDWIDTH * 2 * _PI, .limit = 10.0f };
+//Velocity Loop Gain (Tuning Required)
+//Trap: .Kp = 0.01f, .Ki = 0.0001f, .Kd = 0.0f, .limit = 10.0f
+//Scurve: .Kp = 0.01f, .Ki = 0.01f, .Kd = 0.0f, .limit = 10.0f
+PID_t pid_vel = {.Kp = 0.01f, .Ki = 0.0001f, .Kd = 0.0f, .limit = 10.0f};
+
+//Position Loop Gain (Tuning Required)
+PID_t pid_pos = {.Kp = 100.0f, .Ki = 0.0f, .Kd = 10.0f, .limit = 10.0f};
+
+FOCState_t foc_state = {0};
+uint16_t adc1_buf[4];
+uint16_t adc2_buf[4];
+
+uint16_t angle_raw = 0;
+const float ENC_TO_RAD = _2PI / 16384.0f;
+
+uint32_t last_print_time = 0;
+uint16_t prev_timer_cnt = 0;
+
+static float i_q_filtered = 0.0f;
+static float i_d_filtered = 0.0f;
+float alpha_current = 0.1f;
+
+ProfileState_t profile = {0};
+
+float pos_limit_vel = 800.0f;
+float pos_limit_acc = 300.0f;
+float pos_limit_jerk = 100000000.0f;
+
+SMO_Handle_t smo;
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_TIM1_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_ADC2_Init(void);
+static void MX_OPAMP1_Init(void);
+static void MX_OPAMP2_Init(void);
+static void MX_OPAMP3_Init(void);
+static void MX_CORDIC_Init(void);
+static void MX_TIM6_Init(void);
+static void MX_FDCAN1_Init(void);
+static void MX_TIM16_Init(void);
+/* USER CODE BEGIN PFP */
+void FOC_Init(void);
+void FOC_Loop(void);
+void SVPWM(float v_alpha, float v_beta);
+void updateEncoder(void);
+void calibrate_current(void);
+void updateTotalAngle(void);
+float SCurve_Update(ProfileState_t *p, float target, float max_v, float max_a, float max_j, float dt);
+
+void SMO_Init (void);
+void SMO_Update_Arctan (float v_alpha, float v_beta, float i_alpha, float i_beta);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+//--current offset calibration--------------------------------------//
+void calibrate_current(void) {
+    long sum_adc1 = 0;
+    long sum_adc2 = 0;
+    const int samples = 2048;
+
+    // Set PWM->0
+    TIM1->CCR1 = 0;
+    TIM1->CCR2 = 0;
+    TIM1->CCR3 = 0;
+    HAL_Delay(200);
+
+    for(int i = 0; i < samples; ++i) {
+        sum_adc1 += adc1_buf[0];
+        sum_adc2 += adc2_buf[0];
+        HAL_Delay(1);
+    }
+
+    offset.ia_offset = (float)sum_adc1 / samples;
+    offset.ib_offset = (float)sum_adc2 / samples;
+}
+
+//OPAMP, ADC Initialization
+void FOC_Init(void) {
+	HAL_OPAMP_SelfCalibrate(&hopamp1);
+	HAL_OPAMP_SelfCalibrate(&hopamp2);
+	HAL_OPAMP_SelfCalibrate(&hopamp3);
+
+	// OPAMP start
+    HAL_OPAMP_Start(&hopamp1);
+    HAL_OPAMP_Start(&hopamp2);
+    HAL_OPAMP_Start(&hopamp3);
+
+    HAL_Delay(10);
+
+    // OPAMP calibration
+    HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
+    HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
+
+    // ADC DMA start (current measurement)
+    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc1_buf, 1);
+    HAL_ADC_Start_DMA(&hadc2, (uint32_t*)adc2_buf, 1);
+
+	//PWM start
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
+    HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
+
+    foc_state.theta_offset = 0.0f;
+}
+
+//Encoder offset calibration
+void encoder_Init(void) {
+	float align_V = motor_params.align_voltage;
+
+	for(int i = 0; i < 1000; ++i) {
+		SVPWM(align_V, 0.0f);
+		HAL_Delay(1);
+	}
+
+	updateEncoder();
+
+	float current_mech = angle_raw * ENC_TO_RAD;
+
+	//theta_offset calibration
+	foc_state.theta_offset = current_mech * (float)motor_params.pole_pairs;
+	foc_state.theta_offset = fmodf(foc_state.theta_offset, 6.2831853f);
+
+	SVPWM(0.0f, 0.0f);
+	HAL_Delay(500);
+}
+
+//FOC control loop
+void FOC_Loop(void) {
+	//6. dt calculation for velocity
+	uint16_t current_timer_cnt = TIM6->CNT;
+	dt_us = current_timer_cnt - prev_timer_cnt;
+	prev_timer_cnt = current_timer_cnt;
+	float dt = (float)dt_us * 0.000001f;
+	if (dt < 0.000001f) dt = 0.0001f;
+
+	smo.Ts = dt;
+
+	//1.1. Current measurement
+	foc_state.i_a = ((float)adc1_buf[0] - offset.ia_offset) * CURRENT_SENSE_GAIN; //motor <-> board phase check
+	foc_state.i_b = ((float)adc2_buf[0] - offset.ib_offset) * CURRENT_SENSE_GAIN; //motor <-> board phase check
+	foc_state.i_c = - foc_state.i_a - foc_state.i_b;
+
+	//1.2. Apply offset removal
+	float mid = (foc_state.i_a + foc_state.i_b + foc_state.i_c) / 3.0f;
+
+	foc_state.i_a -= mid;
+	foc_state.i_b -= mid;
+	foc_state.i_c -= mid;
+
+	//2. Encoder & Angle Update
+	updateEncoder();
+	foc_state.theta_mech = angle_raw * ENC_TO_RAD;
+
+	updateTotalAngle();
+
+	float theta = foc_state.theta_mech * (float)motor_params.pole_pairs - foc_state.theta_offset;
+	theta = fmodf(theta, 6.2831853f);
+	if (theta<0) theta += 6.2831853f;
+	foc_state.theta_elec = theta;
+
+	float sin_th = sinf(theta);
+	float cos_th = cosf(theta);
+
+	//3. Clarke Transform (a, b, c -> alpha, beta)
+	foc_state.i_alpha = foc_state.i_a;
+	foc_state.i_beta = (1 / _SQRT3) * (foc_state.i_b - foc_state.i_c);
+
+	SMO_Update_Arctan(foc_state.v_alpha, foc_state.v_beta, foc_state.i_alpha, foc_state.i_beta);
+
+	//4. Park Transform (alpha. beta -> d, q)
+	foc_state.i_d = foc_state.i_alpha * cos_th + foc_state.i_beta * sin_th;
+	foc_state.i_q = foc_state.i_alpha * (-sin_th) + foc_state.i_beta * cos_th;
+
+	//5. Current LPF
+	i_d_filtered = i_d_filtered * (1.0f - alpha_current) + foc_state.i_d * alpha_current;
+	i_q_filtered = i_q_filtered * (1.0f - alpha_current) + foc_state.i_q * alpha_current;
+
+
+	//7. Velocity calculation
+	angle_diff = foc_state.total_angle - foc_state.prev_total_angle_vel;
+	foc_state.prev_total_angle_vel = foc_state.total_angle;
+
+	float raw_velocity = angle_diff / dt;
+	float alpha_vel = 0.02f;
+	foc_state.velocity_filtered = foc_state.velocity_filtered * (1.0f - alpha_vel) + raw_velocity * alpha_vel;
+
+	foc_state.velocity = foc_state.velocity_filtered;
+
+	//8. Control logic (Current, velocity, position)
+
+	//8.1. Control velocity & position independently
+	/*float commanded_Iq = 0.0f;
+
+	switch(foc_state.control_mode) {
+		case MODE_POSITION: {
+			float pos_err = foc_state.target_angle - foc_state.total_angle;
+
+			float position_Kp = pos_err * pid_pos.Kp;
+			float position_Ki = pos_err * pid_pos.Ki;
+			float position_Kd = -foc_state.velocity_filtered * pid_pos.Kd * 100.0f;
+
+			float position_out = position_Kp + position_Kd + position_Ki;
+			commanded_Iq = CONSTRAIN(position_out, -motor_params.max_current, motor_params.max_current);
+			break;
+		}
+		case MODE_VELOCITY: {
+			float vel_err = foc_state.target_velocity - foc_state.velocity;
+			pid_vel.integral_err += vel_err * pid_vel.Ki;
+			pid_vel.integral_err = CONSTRAIN(pid_vel.integral_err, -pid_vel.limit, pid_vel.limit);
+
+			float vel_out = pid_vel.Kp * vel_err + pid_vel.integral_err;
+			commanded_Iq = CONSTRAIN(vel_out, -motor_params.max_current, motor_params.max_current);
+			break;
+		}
+		case MODE_CURRENT: {
+		default:
+			commanded_Iq = foc_state.target_Iq;
+			break;
+		}
+	}
+	if(foc_state.control_mode != MODE_CURRENT) {
+	    foc_state.target_Iq = commanded_Iq;
+	}*/
+
+	//8.2. Current, velocity, position cascade control
+	if (foc_state.control_mode == MODE_POSITION) {
+		position_loop_cnt++;
+		if (position_loop_cnt >= 20) {
+			position_loop_cnt = 0;
+
+			//여기가 핵심임 (오차 이내에서 i제어 꺼서 overshoot 방지)
+			float pos_err = foc_state.target_angle - foc_state.total_angle;
+			if (fabsf(pos_err) == 0.001f) {
+				pid_vel.integral_err = 0.0f;
+			}
+
+			float vel_target = (pid_pos.Kp * pos_err) - (pid_pos.Kd * foc_state.velocity_filtered);
+			foc_state.target_velocity = vel_target;
+			foc_state.target_velocity = CONSTRAIN(vel_target, -800, 800);
+		}
+	}
+	if (foc_state.control_mode >= MODE_VELOCITY) {
+		velocity_loop_cnt++;
+		if (velocity_loop_cnt >= 10) {
+			velocity_loop_cnt = 0;
+			float vel_err = foc_state.target_velocity - foc_state.velocity_filtered;
+			//Anti-Windup (고속 전류 고착 방지, 여전히 문제가 남아있긴 함)
+			float v_sq = foc_state.v_d * foc_state.v_d + foc_state.v_q * foc_state.v_q;
+			//1.0 줄이면 안정적?
+			float v_limit_sq = (motor_params.max_voltage * 1.0f) * (motor_params.max_voltage * 1.0f);
+			if (v_sq < v_limit_sq) {
+				pid_vel.integral_err += vel_err * pid_vel.Ki;
+			}
+			else {
+				if ((vel_err > 0 && pid_vel.integral_err < 0) || (vel_err < 0 && pid_vel.integral_err > 0)) {
+					pid_vel.integral_err += vel_err * pid_vel.Ki;
+				}
+			}
+			pid_vel.integral_err = CONSTRAIN(pid_vel.integral_err, -pid_vel.limit, pid_vel.limit);
+
+			float iq_target = (pid_vel.Kp * vel_err) + pid_vel.integral_err;
+			foc_state.target_Iq = CONSTRAIN(iq_target, -motor_params.max_current, motor_params.max_current);
+		}
+	}
+
+	//8.3. Current, velocity, position S-Curve Control
+	/*velocity_loop_cnt++;
+	    if (velocity_loop_cnt >= 10) {
+	        velocity_loop_cnt = 0;
+	        float motion_dt = dt * 10.0f; // 분주된 dt
+
+	        float active_target = 0.0f;
+	        float lim_v = 0.0f, lim_a = 0.0f, lim_j = 0.0f;
+
+	        // A. 모드별 파라미터 매핑
+	        switch(foc_state.control_mode) {
+	            case MODE_POSITION:
+	                active_target = foc_state.target_angle;
+	                lim_v = pos_limit_vel;
+	                lim_a = pos_limit_acc;
+	                lim_j = pos_limit_jerk;
+	                break;
+	            case MODE_VELOCITY:
+	                active_target = foc_state.target_velocity;
+	                // 속도 모드에서는 파라미터가 한 단계씩 Shift 됩니다.
+	                lim_v = pos_limit_acc;  // 속도의 변화량 = 가속도
+	                lim_a = pos_limit_jerk; // 가속도의 변화량 = 저크
+	                lim_j = 10000000.0f; // 저크의 변화량 = 스냅
+	                break;
+	            case MODE_CURRENT:
+	                active_target = foc_state.target_Iq;
+	                lim_v = 10000000.0f; lim_a = 10000000.0f; lim_j = 10000000.0f; // 제한 없음
+	                break;
+	        }
+
+	        // B. S-Curve 프로파일 업데이트
+	        float smoothed_ref = SCurve_Update(&profile, active_target, lim_v, lim_a, lim_j, motion_dt);
+
+	        // C. Cascade PID 계산
+	        float vel_cmd_final = 0.0f;
+
+	        if (foc_state.control_mode == MODE_POSITION) {
+	            // [Position Control]
+	            // Feedforward 적용: (오차 * P게인) + (프로파일 속도)
+	            float pos_err = smoothed_ref - foc_state.total_angle;
+
+	            // 위치 P제어
+	            float v_pid = pos_err * pid_pos.Kp;
+
+	            // Feedforward: 프로파일러가 생성한 이상적인 속도(profile.current_vel)를 더해줌
+	            // 이것이 없으면 S-Curve를 따라갈 때 위상 지연(Lag)이 발생합니다.
+	            float v_ff = profile.current_vel;
+
+	            vel_cmd_final = v_pid + v_ff;
+	            vel_cmd_final = CONSTRAIN(vel_cmd_final, -motor_params.max_velocity, motor_params.max_velocity);
+	        }
+	        else if (foc_state.control_mode == MODE_VELOCITY) {
+	            // [Velocity Control]
+	            // 속도 모드에서는 프로파일 출력 자체가 목표 속도입니다.
+	            vel_cmd_final = smoothed_ref;
+	        }
+
+	        // D. Velocity Loop (Common)
+	        if (foc_state.control_mode == MODE_POSITION || foc_state.control_mode == MODE_VELOCITY) {
+	            float vel_err = vel_cmd_final - foc_state.velocity_filtered;
+
+	            // I-term accumulation
+	            pid_vel.integral_err += vel_err * pid_vel.Ki * motion_dt; // Use motion_dt
+
+
+	            pid_vel.integral_err = CONSTRAIN(pid_vel.integral_err, -pid_vel.limit, pid_vel.limit);
+
+	            float iq_cmd = (pid_vel.Kp * vel_err) + pid_vel.integral_err;
+	            foc_state.target_Iq = CONSTRAIN(iq_cmd, -motor_params.max_current, motor_params.max_current);
+	        }
+	        else if (foc_state.control_mode == MODE_CURRENT) {
+	             // 전류 모드에서는 프로파일러 값을 직접 목표 전류로 사용 (Soft Start 효과)
+	             foc_state.target_Iq = smoothed_ref;
+	        }
+	    }*/
+
+	//9. Current Controller
+	//d-axis
+	float err_d = foc_state.target_Id - i_d_filtered;
+	pid_id.integral_err += err_d * pid_id.Ki * dt;
+	pid_id.integral_err = CONSTRAIN(pid_id.integral_err, -pid_id.limit, pid_id.limit);
+	foc_state.v_d = pid_id.Kp * err_d + pid_id.integral_err;
+
+	//q-axis
+	float err_q = foc_state.target_Iq - i_q_filtered;
+	pid_iq.integral_err += err_q * pid_iq.Ki * dt;
+	pid_iq.integral_err = CONSTRAIN(pid_iq.integral_err, -pid_iq.limit, pid_iq.limit);
+	foc_state.v_q = pid_iq.Kp * err_q + pid_iq.integral_err;
+
+	foc_state.i_q = i_q_filtered;
+	foc_state.i_d = i_d_filtered;
+
+	//10. Inverse Park Transform
+	foc_state.v_alpha = foc_state.v_d * cos_th - foc_state.v_q * sin_th;
+	foc_state.v_beta = foc_state.v_d * sin_th + foc_state.v_q * cos_th;
+
+	//11. SVPWM
+	SVPWM(foc_state.v_alpha, foc_state.v_beta);
+}
+
+//SVPWM for driving motor
+void SVPWM(float v_alpha, float v_beta) {
+	float abs_V = sqrtf(v_alpha * v_alpha + v_beta * v_beta);
+	float theta_V = atan2f(v_beta, v_alpha);
+
+	if (theta_V < 0) theta_V += 6.2831853f;
+
+	//determine sector
+	int sector = (int)(theta_V / _PI_3) + 1; //truncate the decimal part
+	if (sector > 6) sector = 1;
+
+	//angle in a sector
+	float theta_rel = theta_V - ((float)(sector - 1) * _PI_3);
+
+	//calculate T1, T2, T0
+	float max_voltage = motor_params.max_voltage * 0.57735f; // V_dc / sqrt(3)
+	float M = abs_V / max_voltage;
+
+	if (M > 1.0f) M = 1.0f;
+
+	//SVPWM
+	//t = T/Ts calculation
+	float t1 = M * sinf(_PI_3 - theta_rel);
+	float t2 = M * sinf(theta_rel);
+	float t0 = 1.0f - t1 - t2;
+
+	if (t0 < 0.0f) t0 = 0.0f;
+
+	//switching time t
+	float ta, tb, tc;
+
+	switch(sector) { //Based on switching table in the manual (upper switches)
+		case 1: //sector 1
+			ta = t1 + t2 + 0.5f * t0;
+			tb = t2 + 0.5f * t0;
+			tc = 0.5f * t0;
+			break;
+		case 2: //sector 2
+			ta = t1 + 0.5f * t0;
+			tb = t1 + t2 + 0.5f * t0;
+			tc = 0.5f * t0;
+			break;
+		case 3: //sector 3
+			ta = 0.5f * t0;
+			tb = t1 + t2 + 0.5f * t0;
+			tc = t1 + 0.5f * t0;
+			break;
+		case 4: //sector 4
+			ta = 0.5f * t0;
+			tb = t1 + 0.5f * t0;
+			tc = t1 + t2 + 0.5f * t0;
+			break;
+		case 5: //sector 5
+			ta = t2 + 0.5f * t0;
+			tb = 0.5f * t0;
+			tc = t1 + t2 + 0.5f * t0;
+			break;
+		case 6: //sector 6
+			ta = t1 + t2 + 0.5f * t0;
+			tb = 0.5f * t0;
+			tc = t1 + 0.5f * t0;
+			break;
+		default: // error
+			ta = 0.5f; tb = 0.5f; tc = 0.5f;
+			break;
+	}
+
+	foc_state.duty_a = ta;
+	foc_state.duty_b = tb;
+	foc_state.duty_c = tc;
+
+	float Ts = (float)(htim1.Init.Period + 1);
+
+	TIM1->CCR1 = (uint32_t)(foc_state.duty_a * Ts);
+	TIM1->CCR2 = (uint32_t)(foc_state.duty_b * Ts);
+	TIM1->CCR3 = (uint32_t)(foc_state.duty_c * Ts);
+}
+
+//SPI encoder parity check
+int is_parity_ok(uint16_t data) {
+    uint8_t parity = 0;
+    for (int i = 0; i < 16; i++) {
+        if (data & (1 << i)) {
+            parity++;
+        }
+    }
+    return (parity % 2) == 0;
+}
+
+//Get angle using SPI encoder
+void updateEncoder(void)
+{
+	uint16_t spi_raw_data = 0;
+    CS_LOW();
+    for (int i = 0; i < 16; ++i) {
+        CLK_HIGH();
+        for(volatile int k=0; k<1; ++k);
+        spi_raw_data = (spi_raw_data << 1);
+        if (MISO_READ()) {
+            spi_raw_data |= 1U;
+        }
+        CLK_LOW();
+        for(volatile int k=0; k<1; ++k);
+    }
+    CS_HIGH();
+
+    if (spi_raw_data == 0x0000 || spi_raw_data == 0xFFFF) {
+        return;
+    }
+
+    //parity check
+    if (!is_parity_ok(spi_raw_data)) {
+         return;
+    }
+
+    angle_raw = spi_raw_data & 0x3FFF;
+    //angle_raw = 0x3FFF - (spi_raw_data & 0x3FFF);
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
+{
+    static uint8_t foc_cnt = 0;
+
+    if (hadc->Instance == ADC1)
+    {
+        if (is_foc_enabled == 0) return;
+
+        foc_cnt++;
+        if (foc_cnt < 2) { //callback frequency
+            return;
+        }
+        foc_cnt = 0;
+
+        FOC_Loop();
+    }
+}
+
+float SCurve_Update(ProfileState_t *p, float target, float max_v, float max_a, float max_j, float dt) {
+    if(dt <= 0.0f) return p->current_val;
+
+    float dist_err = target - p->current_val;
+
+    // 1. 목표 속도 계산 (SQRT 프로파일: 등가속도 운동 기반)
+    // s = (v^2) / (2a) 공식을 역산하여 제동 거리를 고려한 속도 계산
+    float v_target = sqrtf(2.0f * max_a * fabsf(dist_err));
+
+    // 속도 제한 및 방향 설정
+    if (v_target > max_v) v_target = max_v;
+    if (dist_err < 0) v_target = -v_target;
+
+    // 2. 필요한 가속도 계산 (P제어 형태)
+    float v_err = v_target - p->current_vel;
+    float a_needed = v_err / dt;
+
+    // 3. 저크(Jerk) 제한 (가속도의 변화량 제한)
+    float da = a_needed - p->current_accel;
+    float max_da = max_j * dt;
+
+    da = CONSTRAIN(da, -max_da, max_da);
+
+    // 4. 상태 업데이트 (적분)
+    p->current_accel += da;
+    p->current_accel = CONSTRAIN(p->current_accel, -max_a, max_a);
+
+    p->current_vel += p->current_accel * dt;
+    p->current_vel = CONSTRAIN(p->current_vel, -max_v, max_v);
+
+    p->current_val += p->current_vel * dt;
+
+    return p->current_val;
+}
+
+void Change_Control_Mode(ControlMode_t new_mode) {
+    if (new_mode == foc_state.control_mode) return;
+
+    if (new_mode == MODE_POSITION) {
+        // 위치 모드로 전환: 현재 위치와 속도를 유지하며 시작
+        profile.current_val = foc_state.total_angle;
+        profile.current_vel = foc_state.velocity_filtered;
+        profile.current_accel = 0.0f;
+
+        // 목표값도 현재 위치로 설정 (Hold Position)
+        foc_state.target_angle = foc_state.total_angle;
+    }
+    else if (new_mode == MODE_VELOCITY) {
+        // 속도 모드로 전환: 현재 속도를 유지하며 시작
+        profile.current_val = foc_state.velocity_filtered;
+        profile.current_vel = 0.0f;   // 여기서는 가속도를 의미함 (0부터 시작)
+        profile.current_accel = 0.0f; // 여기서는 저크를 의미함
+
+        // 목표값도 현재 속도로 설정 (Maintain Velocity)
+        foc_state.target_velocity = foc_state.velocity_filtered;
+    }
+    else if (new_mode == MODE_CURRENT) {
+        foc_state.target_Iq = 0.0f; // 안전을 위해 0으로 리셋
+    }
+
+    // PID 적분항 초기화
+    pid_pos.integral_err = 0.0f;
+    pid_vel.integral_err = 0.0f;
+    pid_pos.prev_err = 0.0f;
+
+    foc_state.control_mode = new_mode;
+}
+
+void updateTotalAngle(void) {
+	float current_angle = foc_state.theta_mech;
+
+	float d_angle = current_angle - foc_state.prev_mech_angle;
+
+	if (d_angle < -3.141592f) {
+		foc_state.rotation_count++;
+	} else if (d_angle > 3.141592f) {
+		foc_state.rotation_count--;
+	}
+
+	foc_state.total_angle = (float)foc_state.rotation_count * 6.2831853f + current_angle;
+
+	foc_state.prev_mech_angle = current_angle;
+}
+
+void UART_Plot_data (float d1, float d2, float d3, float d4) {
+	char buf[64];
+	int len = sprintf(buf, "%.3f %.3f %.3f %.3f\n", d1, d2, d3, d4);
+	HAL_UART_Transmit(&huart2, (uint8_t*)buf, len, 10);
+}
+
+float smo_sign(float val, float width) {
+    if (val > width) return 1.0f;
+    if (val < -width) return -1.0f;
+    return val / width; // Linear region
+}
+
+void SMO_Init(void) {
+    // k_gain: 전류 오차 보정 게인 (전압 단위, V_bus 근처 권장)
+    smo.k_gain = 10.0f;  // 예: 10 ~ 50 사이
+
+    // g: BEMF 관측기 게인 (반응 속도, 0.0 ~ 1.0 사이, 작을수록 필터링 강함)
+    smo.g = 0.1f;       // 예: 0.05 ~ 0.5
+
+    smo.omega_alpha_filter = 0.2f; // 속도 필터
+    smo.min_operating_emf = 0.1f;   // 0.5V 이하는 정지로 간주
+    //smo.phase_advance_gain = 0.0f;
+
+    // 초기화
+    smo.i_alpha_est = 0.0f; smo.i_beta_est = 0.0f;
+    smo.e_alpha_est = 0.0f; smo.e_beta_est = 0.0f;
+    smo.theta_est = 0.0f;
+
+    smo.omega_est = 0.0f;
+        smo.velocity_est = 0.0f;
+        smo.last_i_alpha_error = 0.0f;
+            smo.last_i_beta_error = 0.0f;
+            smo.last_e_theta = 0.0f;
+}
+
+void SMO_Update_Arctan(float v_alpha, float v_beta, float i_alpha_meas, float i_beta_meas) {
+	if (isnan(smo.i_alpha_est) || isnan(smo.i_beta_est) ||
+	        isnan(smo.e_alpha_est) || isnan(smo.e_beta_est) ||
+	        isnan(smo.last_i_alpha_error)) {
+
+	        smo.i_alpha_est = 0.0f;
+	        smo.i_beta_est = 0.0f;
+	        smo.e_alpha_est = 0.0f;
+	        smo.e_beta_est = 0.0f;
+	        smo.last_i_alpha_error = 0.0f;
+	        smo.last_i_beta_error = 0.0f;
+	        smo.theta_est = 0.0f;
+	        smo.omega_est = 0.0f;
+	        smo.velocity_est = 0.0f;
+	        smo.last_e_theta = 0.0f;
+	    }
+
+	smo.v_alpha = v_alpha;
+	    smo.v_beta = v_beta;
+	    smo.i_alpha = i_alpha_meas;
+	    smo.i_beta = i_beta_meas;
+	// A = 1 - (R * Ts) / L
+	smo.A = 1.0f - (motor_params.R_motor * smo.Ts) / motor_params.L_motor;
+
+	// b = Ts / L
+	smo.b = smo.Ts / motor_params.L_motor;
+	if (smo.b > 0.0000001f) {
+	    smo.b_inv = 1.0f / smo.b;
+	} else {
+	    smo.b_inv = 0.0f;
+	}
+
+    // 1. Current Estimation Error
+    float i_alpha_error = smo.i_alpha_est - i_alpha_meas;
+    float i_beta_error  = smo.i_beta_est  - i_beta_meas;
+
+    // 2. Sliding Control Signal (Z)
+    // soft sign을 사용하여 채터링을 줄임
+    float z_alpha = smo.k_gain * smo_sign(i_alpha_error, 0.1f);
+    float z_beta  = smo.k_gain * smo_sign(i_beta_error, 0.1f);
+
+    // 3. Current Observer Update
+    // I_est = A * I_est + b * (V - E) - Z
+    smo.i_alpha_est = smo.A * smo.i_alpha_est + smo.b * (v_alpha - smo.e_alpha_est) - z_alpha;
+    smo.i_beta_est  = smo.A * smo.i_beta_est  + smo.b * (v_beta  - smo.e_beta_est)  - z_beta;
+
+    // 4. Back-EMF Estimation (Disturbance Observer)
+    // 이전 스텝의 Z값을 사용하여 역기전력을 적분
+    float last_z_alpha = smo.k_gain * smo_sign(smo.last_i_alpha_error, 0.1f);
+    float last_z_beta  = smo.k_gain * smo_sign(smo.last_i_beta_error,  0.1f);
+
+    // E_new = E_old + Gain * (Error_dynamics)
+    smo.e_alpha_est += smo.b_inv * smo.g * (i_alpha_error - smo.A * smo.last_i_alpha_error + last_z_alpha);
+    smo.e_beta_est  += smo.b_inv * smo.g * (i_beta_error  - smo.A * smo.last_i_beta_error  + last_z_beta);
+
+    // Error History Update
+    smo.last_i_alpha_error = i_alpha_error;
+    smo.last_i_beta_error  = i_beta_error;
+
+    // 5. Angle & Speed Calculation
+    smo.emf_magnitude = sqrtf(smo.e_alpha_est * smo.e_alpha_est + smo.e_beta_est * smo.e_beta_est);
+
+    //if (smo.emf_magnitude >= smo.min_operating_emf) {
+        // (1) BEMF Angle Calculation
+        smo.e_theta = atan2f(smo.e_beta_est, smo.e_alpha_est);
+
+        // (2) Phase Compensation (90 degree shift)
+        if (smo.omega_est >= 0)
+            smo.theta_est = smo.e_theta - _PI_3 * 1.5f; // -90도 (-PI/2)
+        else
+            smo.theta_est = smo.e_theta + _PI_3 * 1.5f; // +90도 (+PI/2)
+
+        float phase_comp = smo.omega_est * smo.phase_advance_gain;
+        smo.theta_est = smo.theta_est + phase_comp;
+
+        // Angle Wrapping (0 ~ 2PI)
+        if (smo.theta_est < 0.0f) smo.theta_est += _2PI;
+        if (smo.theta_est > _2PI) smo.theta_est -= _2PI;
+
+        // (3) Speed Estimation (Angle Differentiation)
+        float delta_theta = smo.e_theta - smo.last_e_theta;
+
+        // Wrap delta theta (-PI ~ PI)
+        if (delta_theta > _PI)  delta_theta -= _2PI;
+        if (delta_theta < -_PI) delta_theta += _2PI;
+
+        // Calculate Omega (Mechanical Rad/s or Electrical Rad/s depending on usage)
+        // 여기선 Electrical Rad/s로 계산
+        float omega_instant = delta_theta / smo.Ts;
+
+        // LPF for Speed
+        smo.omega_est = smo.omega_est * (1.0f - smo.omega_alpha_filter) + omega_instant * smo.omega_alpha_filter;
+
+        smo.last_e_theta = smo.e_theta;
+
+        smo.velocity_est = smo.omega_est / motor_params.pole_pairs;
+   // } else {
+        // 저속/정지 구간에서는 추정 중단
+        // smo.omega_est = 0.0f; // 필요시 주석 해제
+    //}
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_USART2_UART_Init();
+  MX_TIM1_Init();
+  MX_ADC1_Init();
+  MX_ADC2_Init();
+  MX_OPAMP1_Init();
+  MX_OPAMP2_Init();
+  MX_OPAMP3_Init();
+  MX_CORDIC_Init();
+  MX_TIM6_Init();
+  MX_FDCAN1_Init();
+  MX_TIM16_Init();
+  /* USER CODE BEGIN 2 */
+  FOC_Init();
+  calibrate_current();
+  HAL_TIM_Base_Start(&htim6);
+
+  encoder_Init();
+  SMO_Init();
+
+  pid_id.integral_err = 0.0f;
+  pid_iq.integral_err = 0.0f;
+  pid_vel.integral_err = 0.0f;
+
+  //Initial state setup
+  updateEncoder();
+  foc_state.prev_mech_angle = angle_raw * ENC_TO_RAD;
+  foc_state.rotation_count = 0;
+  foc_state.total_angle = foc_state.prev_mech_angle;
+  foc_state.prev_total_angle_vel = foc_state.total_angle;
+  foc_state.velocity_filtered = 0.0f;
+
+  //Set Initial targets
+  foc_state.target_angle = foc_state.total_angle;
+  foc_state.target_velocity = 0.0f;
+  foc_state.target_Id = 0.0f;
+  foc_state.target_Iq = 0.0f;
+
+  //Set control mode
+  foc_state.control_mode = MODE_VELOCITY;
+
+  is_foc_enabled = 1;
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+
+	  if (HAL_GetTick() - last_print_time >= 10) {
+	      last_print_time = HAL_GetTick();
+
+	      // 현재 모니터링하고 싶은 변수 4개를 선정하여 입력
+	      // 예: 목표 Iq, 실제 Iq(필터링), 현재 속도, 현재 전기각
+	      UART_Plot_data(foc_state.target_angle, foc_state.total_angle, foc_state.theta_elec, smo.theta_est);
+
+	      }
+	  }
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV1;
+  RCC_OscInitStruct.PLL.PLLN = 40;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
+  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_MultiModeTypeDef multimode = {0};
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.GainCompensation = 0;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SEQ_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIG_T1_TRGO;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
+  hadc1.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
+  hadc1.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure the ADC multi-mode
+  */
+  multimode.Mode = ADC_MODE_INDEPENDENT;
+  if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_VOPAMP1;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief ADC2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC2_Init(void)
+{
+
+  /* USER CODE BEGIN ADC2_Init 0 */
+
+  /* USER CODE END ADC2_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC2_Init 1 */
+
+  /* USER CODE END ADC2_Init 1 */
+
+  /** Common config
+  */
+  hadc2.Instance = ADC2;
+  hadc2.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc2.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc2.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc2.Init.GainCompensation = 0;
+  hadc2.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc2.Init.EOCSelection = ADC_EOC_SEQ_CONV;
+  hadc2.Init.LowPowerAutoWait = DISABLE;
+  hadc2.Init.ContinuousConvMode = DISABLE;
+  hadc2.Init.NbrOfConversion = 1;
+  hadc2.Init.DiscontinuousConvMode = DISABLE;
+  hadc2.Init.ExternalTrigConv = ADC_EXTERNALTRIG_T1_TRGO;
+  hadc2.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+  hadc2.Init.DMAContinuousRequests = ENABLE;
+  hadc2.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
+  hadc2.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_VOPAMP2;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC2_Init 2 */
+
+  /* USER CODE END ADC2_Init 2 */
+
+}
+
+/**
+  * @brief CORDIC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_CORDIC_Init(void)
+{
+
+  /* USER CODE BEGIN CORDIC_Init 0 */
+
+  /* USER CODE END CORDIC_Init 0 */
+
+  /* USER CODE BEGIN CORDIC_Init 1 */
+
+  /* USER CODE END CORDIC_Init 1 */
+  hcordic.Instance = CORDIC;
+  if (HAL_CORDIC_Init(&hcordic) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CORDIC_Init 2 */
+
+  /* USER CODE END CORDIC_Init 2 */
+
+}
+
+/**
+  * @brief FDCAN1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_FDCAN1_Init(void)
+{
+
+  /* USER CODE BEGIN FDCAN1_Init 0 */
+
+  /* USER CODE END FDCAN1_Init 0 */
+
+  /* USER CODE BEGIN FDCAN1_Init 1 */
+
+  /* USER CODE END FDCAN1_Init 1 */
+  hfdcan1.Instance = FDCAN1;
+  hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
+  hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
+  hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
+  hfdcan1.Init.AutoRetransmission = ENABLE;
+  hfdcan1.Init.TransmitPause = ENABLE;
+  hfdcan1.Init.ProtocolException = DISABLE;
+  hfdcan1.Init.NominalPrescaler = 10;
+  hfdcan1.Init.NominalSyncJumpWidth = 16;
+  hfdcan1.Init.NominalTimeSeg1 = 11;
+  hfdcan1.Init.NominalTimeSeg2 = 4;
+  hfdcan1.Init.DataPrescaler = 10;
+  hfdcan1.Init.DataSyncJumpWidth = 1;
+  hfdcan1.Init.DataTimeSeg1 = 11;
+  hfdcan1.Init.DataTimeSeg2 = 4;
+  hfdcan1.Init.StdFiltersNbr = 1;
+  hfdcan1.Init.ExtFiltersNbr = 0;
+  hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
+  if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN FDCAN1_Init 2 */
+
+  /* USER CODE END FDCAN1_Init 2 */
+
+}
+
+/**
+  * @brief OPAMP1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_OPAMP1_Init(void)
+{
+
+  /* USER CODE BEGIN OPAMP1_Init 0 */
+
+  /* USER CODE END OPAMP1_Init 0 */
+
+  /* USER CODE BEGIN OPAMP1_Init 1 */
+
+  /* USER CODE END OPAMP1_Init 1 */
+  hopamp1.Instance = OPAMP1;
+  hopamp1.Init.PowerMode = OPAMP_POWERMODE_NORMALSPEED;
+  hopamp1.Init.Mode = OPAMP_PGA_MODE;
+  hopamp1.Init.NonInvertingInput = OPAMP_NONINVERTINGINPUT_IO0;
+  hopamp1.Init.InternalOutput = ENABLE;
+  hopamp1.Init.TimerControlledMuxmode = OPAMP_TIMERCONTROLLEDMUXMODE_DISABLE;
+  hopamp1.Init.PgaConnect = OPAMP_PGA_CONNECT_INVERTINGINPUT_IO0_BIAS;
+  hopamp1.Init.PgaGain = OPAMP_PGA_GAIN_16_OR_MINUS_15;
+  hopamp1.Init.UserTrimming = OPAMP_TRIMMING_FACTORY;
+  if (HAL_OPAMP_Init(&hopamp1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN OPAMP1_Init 2 */
+
+  /* USER CODE END OPAMP1_Init 2 */
+
+}
+
+/**
+  * @brief OPAMP2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_OPAMP2_Init(void)
+{
+
+  /* USER CODE BEGIN OPAMP2_Init 0 */
+
+  /* USER CODE END OPAMP2_Init 0 */
+
+  /* USER CODE BEGIN OPAMP2_Init 1 */
+
+  /* USER CODE END OPAMP2_Init 1 */
+  hopamp2.Instance = OPAMP2;
+  hopamp2.Init.PowerMode = OPAMP_POWERMODE_NORMALSPEED;
+  hopamp2.Init.Mode = OPAMP_PGA_MODE;
+  hopamp2.Init.NonInvertingInput = OPAMP_NONINVERTINGINPUT_IO0;
+  hopamp2.Init.InternalOutput = ENABLE;
+  hopamp2.Init.TimerControlledMuxmode = OPAMP_TIMERCONTROLLEDMUXMODE_DISABLE;
+  hopamp2.Init.PgaConnect = OPAMP_PGA_CONNECT_INVERTINGINPUT_IO0_BIAS;
+  hopamp2.Init.PgaGain = OPAMP_PGA_GAIN_16_OR_MINUS_15;
+  hopamp2.Init.UserTrimming = OPAMP_TRIMMING_FACTORY;
+  if (HAL_OPAMP_Init(&hopamp2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN OPAMP2_Init 2 */
+
+  /* USER CODE END OPAMP2_Init 2 */
+
+}
+
+/**
+  * @brief OPAMP3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_OPAMP3_Init(void)
+{
+
+  /* USER CODE BEGIN OPAMP3_Init 0 */
+
+  /* USER CODE END OPAMP3_Init 0 */
+
+  /* USER CODE BEGIN OPAMP3_Init 1 */
+
+  /* USER CODE END OPAMP3_Init 1 */
+  hopamp3.Instance = OPAMP3;
+  hopamp3.Init.PowerMode = OPAMP_POWERMODE_NORMALSPEED;
+  hopamp3.Init.Mode = OPAMP_PGA_MODE;
+  hopamp3.Init.NonInvertingInput = OPAMP_NONINVERTINGINPUT_IO0;
+  hopamp3.Init.InternalOutput = ENABLE;
+  hopamp3.Init.TimerControlledMuxmode = OPAMP_TIMERCONTROLLEDMUXMODE_DISABLE;
+  hopamp3.Init.PgaConnect = OPAMP_PGA_CONNECT_INVERTINGINPUT_IO0_BIAS;
+  hopamp3.Init.PgaGain = OPAMP_PGA_GAIN_16_OR_MINUS_15;
+  hopamp3.Init.UserTrimming = OPAMP_TRIMMING_FACTORY;
+  if (HAL_OPAMP_Init(&hopamp3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN OPAMP3_Init 2 */
+
+  /* USER CODE END OPAMP3_Init 2 */
+
+}
+
+/**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_CENTERALIGNED1;
+  htim1.Init.Period = 4999;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter =0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 128;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.BreakFilter = 0;
+  sBreakDeadTimeConfig.BreakAFMode = TIM_BREAK_AFMODE_INPUT;
+  sBreakDeadTimeConfig.Break2State = TIM_BREAK2_DISABLE;
+  sBreakDeadTimeConfig.Break2Polarity = TIM_BREAK2POLARITY_HIGH;
+  sBreakDeadTimeConfig.Break2Filter = 0;
+  sBreakDeadTimeConfig.Break2AFMode = TIM_BREAK_AFMODE_INPUT;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+  HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
+  * @brief TIM6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM6_Init(void)
+{
+
+  /* USER CODE BEGIN TIM6_Init 0 */
+
+  /* USER CODE END TIM6_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM6_Init 1 */
+
+  /* USER CODE END TIM6_Init 1 */
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 159;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 65535;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM6_Init 2 */
+
+  /* USER CODE END TIM6_Init 2 */
+
+}
+
+/**
+  * @brief TIM16 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM16_Init(void)
+{
+
+  /* USER CODE BEGIN TIM16_Init 0 */
+
+  /* USER CODE END TIM16_Init 0 */
+
+  /* USER CODE BEGIN TIM16_Init 1 */
+
+  /* USER CODE END TIM16_Init 1 */
+  htim16.Instance = TIM16;
+  htim16.Init.Prescaler = 0;
+  htim16.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim16.Init.Period = 15999;
+  htim16.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim16.Init.RepetitionCounter = 0;
+  htim16.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim16) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM16_Init 2 */
+
+  /* USER CODE END TIM16_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 1000000;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart2, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart2, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMAMUX1_CLK_ENABLE();
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+  /* DMA1_Channel2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
+  /* DMA1_Channel3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
+  /* DMA1_Channel4_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel4_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel4_IRQn);
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, CAN_TERM_Pin|STATUS_Pin|CAN_SHDN_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(BB_SPI_CLK_GPIO_Port, BB_SPI_CLK_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, BB_SPI_MOSI_Pin|BB_SPI_CS_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pins : CAN_TERM_Pin STATUS_Pin CAN_SHDN_Pin */
+  GPIO_InitStruct.Pin = CAN_TERM_Pin|STATUS_Pin|CAN_SHDN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : BB_SPI_MISO_Pin */
+  GPIO_InitStruct.Pin = BB_SPI_MISO_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(BB_SPI_MISO_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : BB_SPI_CLK_Pin BB_SPI_CS_Pin */
+  GPIO_InitStruct.Pin = BB_SPI_CLK_Pin|BB_SPI_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : BB_SPI_MOSI_Pin */
+  GPIO_InitStruct.Pin = BB_SPI_MOSI_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
+  HAL_GPIO_Init(BB_SPI_MOSI_GPIO_Port, &GPIO_InitStruct);
+
+  /**/
+  __HAL_SYSCFG_FASTMODEPLUS_ENABLE(SYSCFG_FASTMODEPLUS_PB6);
+
+  /**/
+  __HAL_SYSCFG_FASTMODEPLUS_ENABLE(SYSCFG_FASTMODEPLUS_PB8);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
