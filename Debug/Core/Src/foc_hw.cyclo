@@ -1,0 +1,7 @@
+../Core/Src/foc_hw.c:23:6:HW_FOC_Init	1
+../Core/Src/foc_hw.c:48:12:is_parity_ok	3
+../Core/Src/foc_hw.c:56:6:HW_Update_Encoder_BB	8
+../Core/Src/foc_hw.c:75:6:HW_Read_Currents	1
+../Core/Src/foc_hw.c:81:6:HW_Write_PWM	1
+../Core/Src/foc_hw.c:88:6:HW_Calibrate_Current_Offset	2
+../Core/Src/foc_hw.c:104:6:HW_Align_Encoder	2

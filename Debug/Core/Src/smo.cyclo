@@ -1,0 +1,3 @@
+../Core/Src/smo.c:13:14:smo_sign	3
+../Core/Src/smo.c:19:6:SMO_Init	1
+../Core/Src/smo.c:44:6:SMO_Update_Arctan	12

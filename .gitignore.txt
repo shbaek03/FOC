@@ -1,0 +1,12 @@
+Debug/
+Release/
+
+*.o
+*.d
+*.su
+*.elf
+*.list
+*.map
+
+Thumbs.db
+.DS_Store
